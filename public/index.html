@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Subtitle Desk · 字幕校对台</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>🎬 Subtitle Desk <span class="subtitle">小团队字幕校对台</span></h1>
+  </header>
+
+  <main id="app"></main>
+
+  <!-- 编辑片段弹窗 -->
+  <div id="editorModal" class="modal hidden">
+    <div class="modal-card">
+      <h3 id="editorTitle">编辑片段</h3>
+      <p class="meta">片段 #<span id="editorId"></span> ｜ 所见修订号 <b id="editorRevision"></b>
+        <span id="editorReviewNote" class="warn hidden">（已审；保存修改将撤销审校状态）</span></p>
+      <div class="form-row">
+        <label>起点 (ms)
+          <input id="editStart" type="number" min="0" step="1" />
+        </label>
+        <button type="button" class="btn small" id="editStartNow">取播放位置</button>
+        <label>终点 (ms)
+          <input id="editEnd" type="number" min="1" step="1" />
+        </label>
+        <button type="button" class="btn small" id="editEndNow">取播放位置</button>
+      </div>
+      <label class="block">字幕文本
+        <textarea id="editText" rows="4"></textarea>
+      </label>
+      <p id="editorError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="editorCancel">取消（保留原稿）</button>
+        <button type="button" class="btn primary" id="editorSave">保存修改</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 冲突弹窗 -->
+  <div id="conflictModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>⚠️ 修订冲突</h3>
+      <p id="conflictMessage" class="error"></p>
+      <p class="meta">他人修改后的当前内容（修订号 <b id="conflictRevision"></b>）：</p>
+      <div class="conflict-current">
+        <p><span class="tag" id="conflictTime"></span>
+           <span class="tag ok hidden" id="conflictReviewed">已审</span>
+           <span class="tag warn hidden" id="conflictNotReviewed">待审</span></p>
+        <pre id="conflictText"></pre>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="conflictDiscard">放弃我的修改，使用当前内容</button>
+        <button type="button" class="btn primary" id="conflictReload">基于当前内容重新编辑</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SRT 导入弹窗 -->
+  <div id="importModal" class="modal hidden">
+    <div class="modal-card wide">
+      <h3>导入本地 SRT 到草稿</h3>
+      <p class="meta">导入的片段一律为<b>待审</b>状态；已发布版本及其 SRT 不会受影响。
+        先预览解析结果与时间冲突，再选择「追加到草稿」或「替换整个草稿」。</p>
+      <div class="form-row">
+        <label>SRT 文件（UTF-8，可含 BOM）
+          <input type="file" id="importFile" accept=".srt,text/plain" />
+        </label>
+        <button type="button" class="btn primary" id="importPreviewBtn">解析并预览</button>
+      </div>
+      <p id="importFileMsg" class="meta"></p>
+      <p id="importError" class="error"></p>
+
+      <div id="importResult" class="hidden">
+        <p class="meta" id="importSummary"></p>
+        <div id="importConflictBox" class="conflict-box hidden">
+          <b>⚠️ 与当前草稿的时间冲突</b>
+          <ul id="importConflictList"></ul>
+          <p class="warn">存在冲突时「追加到草稿」不可用；可先调整已有片段，或选择「替换整个草稿」。</p>
+        </div>
+        <div class="import-scroll">
+          <table class="seg-table">
+            <thead><tr><th>条目</th><th>SRT 序号</th><th>原文件行号</th><th>时间</th><th>文本</th></tr></thead>
+            <tbody id="importTbody"></tbody>
+          </table>
+          <p class="meta hidden" id="importMoreHint"></p>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="importCancel">取消</button>
+        <button type="button" class="btn danger" id="importReplaceBtn" disabled>替换整个草稿（先删除现有草稿片段）</button>
+        <button type="button" class="btn primary" id="importAppendBtn" disabled>追加到草稿</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
