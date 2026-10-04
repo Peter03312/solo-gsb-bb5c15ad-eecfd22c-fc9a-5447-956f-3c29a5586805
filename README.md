@@ -26,6 +26,12 @@
   - 再选择**追加到草稿**（有冲突时禁止）或**替换整个草稿**；导入片段一律为**待审**，已发布版本及其 SRT 不变；
   - 空文件、格式错误、负时间、起止倒置、越过视频时长、导入条目互相重叠时返回**具体条目与行号**，且绝不写入；
   - 预览与确认之间草稿若被任何人修改，确认返回 `409` 并要求重新预览，绝不覆盖他人更改；整批写入在一个事务内，要么全部成功要么完全不变。
+- **历史版本区间恢复（预览 → 确认）**：把某个已发布版本在指定整数毫秒区间内的片段整体恢复到草稿：
+  - 先**预览**：并列查看区间内「发布快照 vs 当前草稿」的字幕，以及确认后将移除、将恢复的片段清单；
+  - 区间起点须早于终点且均在视频时长内；**边界不得穿过任一侧片段**（端点相接允许），穿过则拒绝并逐条指出片段与时间；
+  - 确认后区间内草稿片段被移除，历史片段作为**待审新片段**写入（修订号从 1 开始）；区间外草稿片段及其修订号、历史发布版本与 SRT 导出语义均不变；
+  - 确认的版本与区间须与预览一致；预览后草稿发生任何增删改或审校变化，确认返回 `409` 并要求重新预览；
+  - 版本不存在、区间越界或替换后时间线不合法时不写入任何内容；整批恢复在一个事务内原子完成。
 
 ## 一键启动（Docker Compose，推荐）
 
@@ -66,7 +72,7 @@ npm start
 
 同样访问 http://localhost:8080 。数据默认写入项目下 `./data/`。
 
-运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本与 SRT 导入/冲突/整批原子写入等 108 个断言）：
+运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入与历史版本区间恢复等 166 个断言）：
 
 ```bash
 npm test
@@ -99,12 +105,15 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
    核对每条的 SRT 序号、原文件行号、时间与多行文本，以及与当前草稿的冲突；
    无冲突可「追加到草稿」，或随时「替换整个草稿」（已发布版本不受影响）。
    若预览期间草稿被他人改动，确认时会被拒绝并自动按最新草稿重新预览。
-5. 右侧「发布与下载」面板实时列出阻塞发布的问题；全部满足后点「发布新版本」。
-6. 用「下载 SRT ▾」选择草稿或任一已发布版本导出。
+5. 需要把某段字幕回退到历史版本时，点「↩ 区间恢复…」：选择已发布版本并填写整数毫秒区间，
+   「预览恢复」后并列核对区间内发布快照与当前草稿、以及将移除/恢复的清单，再「确认恢复」；
+   恢复片段为待审，需重新审校后才能再次发布。
+6. 右侧「发布与下载」面板实时列出阻塞发布的问题；全部满足后点「发布新版本」。
+7. 用「下载 SRT ▾」选择草稿或任一已发布版本导出。
 
 ## HTTP API 摘要
 
-所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外）。
+所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外；区间恢复确认改持预览令牌 `token`）。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -121,6 +130,8 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 | `GET` | `/api/videos/:id/publications` | 已发布版本列表 |
 | `POST` | `/api/videos/:id/srt/preview` | 预览 SRT 导入（multipart 字段 `srt`，或 JSON `{content}`），返回条目/行号/草稿冲突与确认令牌 `token` |
 | `POST` | `/api/videos/:id/srt/import` | 确认写入：multipart 或 JSON 携带 `srt`/`content`、`mode=append\|replace`、预览返回的 `token` |
+| `POST` | `/api/videos/:id/restore/preview` | 预览区间恢复 `{version,start_ms,end_ms}`，返回两侧片段清单（`to_restore`/`to_remove`）与确认令牌 `token` |
+| `POST` | `/api/videos/:id/restore/confirm` | 确认区间恢复 `{version,start_ms,end_ms,token}`，事务内整批替换 |
 | `GET` | `/api/videos/:id/srt?version=` | 导出 SRT：`draft`（默认）/ `published` / `1` 等版本号 |
 
 错误响应统一为 `{ "error": { "code", "message", "current?" } }`：
@@ -195,6 +206,71 @@ curl -s -X POST http://127.0.0.1:8080/api/videos/12/srt/import \
 | `422 invalid_mode` | `mode` 不是 `append` / `replace` |
 | `409 preview_required` | 缺失/伪造/过期（服务重启）令牌，需先预览 |
 | `409 draft_changed` | 预览后草稿被修改；响应附 `current_segments`，必须重新预览后再确认 |
+
+### 区间恢复调用示例（两步：预览 → 确认）
+
+把已发布版本 `v1` 在 2000–5000ms 区间内的片段整体恢复到草稿。版本与区间随确认请求原样提交，
+服务端用 HMAC 令牌把「版本 + 区间 + 草稿指纹」绑定到确认请求；令牌随服务进程重启失效。
+
+第一步——预览（不写入），并列返回发布快照与当前草稿在区间内的片段（即确认后将恢复/将移除的清单）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/videos/12/restore/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1,"start_ms":2000,"end_ms":5000}'
+```
+
+成功返回（节选）：
+
+```json
+{
+  "version": 1,
+  "start_ms": 2000,
+  "end_ms": 5000,
+  "duration_ms": 60000,
+  "to_restore": [ { "snapshot_index": 2, "start_ms": 3000, "end_ms": 4000, "text": "历史第二句" } ],
+  "to_remove":  [ { "id": 7, "start_ms": 3000, "end_ms": 4000, "text": "草稿第二句(改)",
+                    "reviewed": false, "revision": 3 } ],
+  "token": "eyJ2IjoxMiwibSI6InJlc3RvcmUi…….签名"
+}
+```
+
+区间边界穿过任一侧片段时返回 `422 range_crosses_segment`，`crossings[]` 逐条指出片段与时间：
+
+```json
+{
+  "error": {
+    "code": "range_crosses_segment",
+    "message": "区间边界穿过 2 个片段，请把起点/终点调整到片段间隙（端点相接允许）：\n区间终点 3500ms 穿过当前草稿片段 #7（3000–4000ms）",
+    "crossings": [
+      { "side": "draft", "boundary": "end", "at": 3500, "segment_id": 7, "start_ms": 3000, "end_ms": 4000, "message": "区间终点 3500ms 穿过当前草稿片段 #7（3000–4000ms）" },
+      { "side": "published", "boundary": "end", "at": 3500, "snapshot_index": 2, "start_ms": 3000, "end_ms": 4000, "message": "区间终点 3500ms 穿过发布快照第 2 条（3000–4000ms）" }
+    ]
+  }
+}
+```
+
+第二步——确认（与预览完全相同的 `version`/`start_ms`/`end_ms` + 预览 `token`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/videos/12/restore/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1,"start_ms":2000,"end_ms":5000,"token":"eyJ2IjoxMiwibSI6InJlc3RvcmUi…….签名"}'
+```
+
+返回 `201 { ok, version, start_ms, end_ms, removed_count, restored_count, removed, restored, segments }`：
+区间内草稿片段被移除，历史片段作为**待审**新片段写入（新 id、修订号从 1 开始）；
+区间外草稿片段及其修订号、历史发布版本与 SRT 导出均不变。失败约定：
+
+| 状态 / code | 含义 |
+| --- | --- |
+| `422 invalid_version` / `422 invalid_range` | 版本号非法；区间非整数、起点不早于终点、为负或越过视频时长 |
+| `404 version_not_found` | 指定发布版本不存在，未写入 |
+| `422 range_crosses_segment` | 区间边界穿过草稿或发布快照片段（`crossings[]` 逐条指出片段与时间），未写入 |
+| `422 invalid_timeline` | 替换后时间线不合法，未写入 |
+| `422 restore_params_changed` | 确认的版本或区间与预览不一致，需按预览参数确认或重新预览 |
+| `409 preview_required` | 缺失/伪造/过期（服务重启）的恢复预览令牌，需先预览 |
+| `409 draft_changed` | 预览后草稿被修改（增删改或审校变化）；响应附 `current_segments`，必须重新预览后再确认 |
 
 ## 数据布局
 

@@ -557,8 +557,8 @@ function draftFingerprint(segments) {
 function srtHash(content) {
   return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
 }
-function makePreviewToken({ videoId, mode, draftHash, contentHash }) {
-  const payload = JSON.stringify({ v: videoId, m: mode, d: draftHash, c: contentHash });
+function makePreviewToken({ videoId, mode, draftHash, contentHash, extra }) {
+  const payload = JSON.stringify({ v: videoId, m: mode, d: draftHash, c: contentHash, ...(extra || {}) });
   const b64 = Buffer.from(payload, 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(b64).digest('base64url');
   return `${b64}.${sig}`;
@@ -713,6 +713,194 @@ router.post('/videos/:id(\\d+)/srt/import', srtUploadOptional, (req, res, next) 
       ok: true,
       mode: result.mode,
       imported_count: result.imported_count,
+      segments: listSegments(video.id),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ---------------- 历史版本区间恢复（预览 -> 确认整体替换） ---------------- */
+
+// 解析并校验恢复请求：版本号为正整数；区间为整数毫秒、起点早于终点、均在视频时长内
+function readRestoreRange(body, video) {
+  const version = Number(body && body.version);
+  if (!Number.isInteger(version) || version < 1) {
+    throw new ApiError(422, 'invalid_version', '请指定要恢复的历史发布版本号 version（正整数）');
+  }
+  if (!body || body.start_ms == null || body.end_ms == null) {
+    throw new ApiError(422, 'invalid_range', '请同时提供区间起点 start_ms 与终点 end_ms（整数毫秒）');
+  }
+  const startMs = Number(body.start_ms);
+  const endMs = Number(body.end_ms);
+  if (!isInt(startMs) || !isInt(endMs)) {
+    throw new ApiError(422, 'invalid_range', '区间起点 start_ms 与终点 end_ms 必须为整数毫秒');
+  }
+  if (startMs < 0) {
+    throw new ApiError(422, 'invalid_range', `区间起点不能为负数（收到 ${startMs}ms）`);
+  }
+  if (startMs >= endMs) {
+    throw new ApiError(422, 'invalid_range', `区间起点（${startMs}ms）必须早于终点（${endMs}ms）`);
+  }
+  if (endMs > video.duration_ms) {
+    throw new ApiError(422, 'invalid_range', `区间终点 ${endMs}ms 越过视频时长 ${video.duration_ms}ms`);
+  }
+  return { version, startMs, endMs };
+}
+
+function loadPublication(videoId, version) {
+  const pub = get()
+    .prepare('SELECT * FROM publications WHERE video_id = ? AND version = ?')
+    .get(videoId, version);
+  if (!pub) throw new ApiError(404, 'version_not_found', `已发布版本 v${version} 不存在`);
+  return pub;
+}
+
+// 计算恢复计划：边界不得穿过任一侧片段；区间内以历史片段整体替换；替换后时间线必须合法。
+// 任何不合法都抛错，调用方保证不写入。
+function planRestore(video, snapshotEntries, draftSegments, startMs, endMs) {
+  const crossings = [];
+  const collectCrossings = (side, seg, label, extra) => {
+    for (const [boundary, at] of [['start', startMs], ['end', endMs]]) {
+      if (seg.start_ms < at && at < seg.end_ms) {
+        const sideName = side === 'draft' ? '当前草稿片段' : '发布快照';
+        const boundaryName = boundary === 'start' ? '起点' : '终点';
+        crossings.push({
+          side,
+          boundary,
+          at,
+          ...extra,
+          start_ms: seg.start_ms,
+          end_ms: seg.end_ms,
+          message: `区间${boundaryName} ${at}ms 穿过${sideName}${label}（${seg.start_ms}–${seg.end_ms}ms）`,
+        });
+      }
+    }
+  };
+  draftSegments.forEach((s) => collectCrossings('draft', s, ` #${s.id}`, { segment_id: s.id }));
+  snapshotEntries.forEach((e, i) => collectCrossings('published', e, `第 ${i + 1} 条`, { snapshot_index: i + 1 }));
+  if (crossings.length) {
+    throw new ApiError(422, 'range_crosses_segment',
+      `区间边界穿过 ${crossings.length} 个片段，请把起点/终点调整到片段间隙（端点相接允许）：\n${crossings[0].message}`,
+      { crossings });
+  }
+
+  // 边界不穿过后，与区间相交的片段必然整体落在区间内
+  const inRange = (s) => s.start_ms >= startMs && s.end_ms <= endMs;
+  const toRemove = draftSegments.filter(inRange);
+  const toRestore = snapshotEntries
+    .map((e, i) => ({
+      snapshot_index: i + 1,
+      start_ms: e.start_ms,
+      end_ms: e.end_ms,
+      text: e.text == null ? '' : String(e.text),
+    }))
+    .filter(inRange);
+
+  // 替换后的完整时间线必须仍然合法（不信任快照内容，合并后全量校验）
+  const removeIds = new Set(toRemove.map((s) => s.id));
+  const merged = [
+    ...draftSegments.filter((s) => !removeIds.has(s.id)),
+    ...toRestore.map((e) => ({ id: `(恢复条目${e.snapshot_index})`, start_ms: e.start_ms, end_ms: e.end_ms })),
+  ];
+  const check = validateTimeline(merged, video.duration_ms);
+  if (!check.ok) {
+    throw new ApiError(422, 'invalid_timeline', `按该区间恢复后时间线不合法，未写入任何内容：${check.reason}`);
+  }
+  return { toRemove, toRestore };
+}
+
+router.post('/videos/:id(\\d+)/restore/preview', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const { version, startMs, endMs } = readRestoreRange(req.body, video);
+    const pub = loadPublication(video.id, version);
+    const snapshot = JSON.parse(pub.snapshot);
+    const draft = listSegments(video.id);
+    const plan = planRestore(video, snapshot, draft, startMs, endMs);
+
+    const token = makePreviewToken({
+      videoId: video.id,
+      mode: 'restore',
+      draftHash: draftFingerprint(draft),
+      extra: { ver: version, s: startMs, e: endMs },
+    });
+
+    res.json({
+      version,
+      start_ms: startMs,
+      end_ms: endMs,
+      duration_ms: video.duration_ms,
+      // 并列对照：发布快照在区间内的片段（确认后恢复）vs 当前草稿在区间内的片段（确认后移除）
+      to_restore: plan.toRestore,
+      to_remove: plan.toRemove,
+      token,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/videos/:id(\\d+)/restore/confirm', (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const video = loadVideo(videoId);
+    const { version, startMs, endMs } = readRestoreRange(req.body, video);
+
+    const token = readPreviewToken(req.body && req.body.token);
+    if (!token || token.v !== video.id || token.m !== 'restore') {
+      throw new ApiError(409, 'preview_required', '缺少有效的恢复预览令牌：请先调用恢复预览接口，再以预览返回的 token 确认');
+    }
+    if (token.ver !== version || token.s !== startMs || token.e !== endMs) {
+      throw new ApiError(422, 'restore_params_changed',
+        '确认的版本或区间与预览不一致，请按预览时的版本与区间确认，或重新预览；本次未写入任何内容');
+    }
+    const currentSegments = listSegments(video.id);
+    if (token.d !== draftFingerprint(currentSegments)) {
+      throw new ApiError(409, 'draft_changed',
+        '预览之后草稿已被修改（可能是他人操作）。为避免覆盖更改，请重新预览后再确认；本次未写入任何内容',
+        { current_segments: currentSegments });
+    }
+
+    // 事务内重新加载并完整复算恢复计划（不信任预览结果），整批原子写入
+    const result = get().transaction(() => {
+      const lockedVideo = get().prepare('SELECT * FROM videos WHERE id = ?').get(videoId);
+      if (!lockedVideo) throw new ApiError(404, 'not_found', `视频 #${videoId} 不存在`);
+      const pub = get()
+        .prepare('SELECT * FROM publications WHERE video_id = ? AND version = ?')
+        .get(videoId, version);
+      if (!pub) throw new ApiError(404, 'version_not_found', `已发布版本 v${version} 不存在`);
+      const snapshot = JSON.parse(pub.snapshot);
+      const draftRows = get()
+        .prepare('SELECT * FROM segments WHERE video_id = ? ORDER BY start_ms, id')
+        .all(videoId)
+        .map(mapSegment);
+      const plan = planRestore(lockedVideo, snapshot, draftRows, startMs, endMs);
+
+      const ts = now();
+      const del = get().prepare('DELETE FROM segments WHERE id = ? AND video_id = ?');
+      for (const s of plan.toRemove) del.run(s.id, videoId);
+      // 恢复片段作为新草稿片段写入：一律待审、修订号从 1 开始；区间外片段及其修订号不变
+      const insert = get().prepare(
+        `INSERT INTO segments (video_id, start_ms, end_ms, text, reviewed, revision, updated_at)
+         VALUES (?, ?, ?, ?, 0, 1, ?)`
+      );
+      const restored = plan.toRestore.map((e) => {
+        const info = insert.run(videoId, e.start_ms, e.end_ms, e.text, ts);
+        return mapSegment(get().prepare('SELECT * FROM segments WHERE id = ?').get(info.lastInsertRowid));
+      });
+      return { removed: plan.toRemove, restored };
+    })();
+
+    res.status(201).json({
+      ok: true,
+      version,
+      start_ms: startMs,
+      end_ms: endMs,
+      removed_count: result.removed.length,
+      restored_count: result.restored.length,
+      removed: result.removed,
+      restored: result.restored,
       segments: listSegments(video.id),
     });
   } catch (err) {

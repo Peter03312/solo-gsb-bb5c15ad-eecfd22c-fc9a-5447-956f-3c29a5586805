@@ -98,6 +98,58 @@
     </div>
   </div>
 
+  <!-- 历史版本区间恢复弹窗 -->
+  <div id="restoreModal" class="modal hidden">
+    <div class="modal-card wide">
+      <h3>从历史发布版本恢复区间</h3>
+      <p class="meta">选择历史版本与整数毫秒区间（起点早于终点、均在视频时长内，且边界不得穿过任一侧片段，端点相接允许）。
+        确认后：区间内的草稿片段被移除，以该版本区间内的片段整体替换；恢复片段为<b>待审</b>新片段（修订号从 1 开始），
+        区间外草稿片段及其修订号、历史发布版本均不受影响。</p>
+      <div class="form-row">
+        <label>历史发布版本
+          <select id="restoreVersion"></select>
+        </label>
+        <label>区间起点 (ms)
+          <input id="restoreStart" type="number" min="0" step="1" />
+        </label>
+        <label>区间终点 (ms)
+          <input id="restoreEnd" type="number" min="1" step="1" />
+        </label>
+        <button type="button" class="btn primary" id="restorePreviewBtn">预览恢复</button>
+      </div>
+      <p id="restoreError" class="error"></p>
+
+      <div id="restoreResult" class="hidden">
+        <p class="meta" id="restoreSummary"></p>
+        <div class="restore-compare">
+          <div>
+            <h4 id="restorePubTitle">发布快照（区间内）</h4>
+            <div class="import-scroll">
+              <table class="seg-table">
+                <thead><tr><th>快照条目</th><th>时间</th><th>文本</th></tr></thead>
+                <tbody id="restorePubTbody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h4>当前草稿（区间内，确认后移除）</h4>
+            <div class="import-scroll">
+              <table class="seg-table">
+                <thead><tr><th>#</th><th>时间</th><th>文本</th><th>状态</th></tr></thead>
+                <tbody id="restoreDraftTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="restoreCancel">取消</button>
+        <button type="button" class="btn primary" id="restoreConfirmBtn" disabled>确认恢复</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="/app.js"></script>

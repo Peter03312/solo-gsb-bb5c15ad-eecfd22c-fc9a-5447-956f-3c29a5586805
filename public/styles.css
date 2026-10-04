@@ -194,6 +194,11 @@ video { width: 100%; background: #000; border-radius: 8px; max-height: 420px; }
 .conflict-box li { margin: 3px 0; }
 tr.import-conflict td { background: rgba(240,169,59,.12); }
 
+/* 历史版本区间恢复 */
+.restore-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
+.restore-compare h4 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
+@media (max-width: 720px) { .restore-compare { grid-template-columns: 1fr; } }
+
 /* toast */
 .toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);

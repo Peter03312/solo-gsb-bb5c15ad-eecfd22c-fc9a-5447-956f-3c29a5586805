@@ -218,6 +218,7 @@ async function main() {
   eq('Content-Range 正确', rangeRes.headers.get('content-range'), 'bytes 0-15/256');
 
   await srtImportTests();
+  await restoreTests();
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   if (failed) process.exit(1);
@@ -435,6 +436,180 @@ async function srtImportTests() {
   // 不存在视频
   p = await srtPreview(999999, '1\n00:00:01,000 --> 00:00:02,000\nx');
   check('未知视频预览 -> 404', p.status === 404);
+}
+
+async function restoreTests() {
+  console.log('11. 历史版本区间恢复：预览与边界规则');
+  const rv = await uploadVideo('区间恢复', 10000, 80);
+  const addSeg = async (start, end, text) =>
+    (await req('POST', `/videos/${rv.id}/segments`, { start_ms: start, end_ms: end, text })).json.segment;
+  const reviewSeg = (vid, seg) =>
+    req('POST', `/videos/${vid}/segments/${seg.id}/review`, { reviewed: true, revision: seg.revision });
+  const getSegs = async (vid) => (await req('GET', `/videos/${vid}`)).json.segments;
+
+  // v1：甲(1000-2000) 乙(3000-4000) 丙(5000-6000)，全部已审
+  const A = await addSeg(1000, 2000, '甲');
+  let B = await addSeg(3000, 4000, '乙');
+  const C = await addSeg(5000, 6000, '丙');
+  for (const s of [A, B, C]) await reviewSeg(rv.id, s);
+  let r = await req('POST', `/videos/${rv.id}/publish`, {});
+  check('发布 v1', r.status === 201 && r.json.publication.version === 1);
+
+  // 演进出 v2：改乙、删丙、新增丁(6500-7000) 戊(8000-9000)
+  B = (await getSegs(rv.id)).find((x) => x.id === B.id);
+  await req('PUT', `/videos/${rv.id}/segments/${B.id}`, { start_ms: 3000, end_ms: 4000, text: '乙改', revision: B.revision });
+  const cNow = (await getSegs(rv.id)).find((x) => x.id === C.id);
+  await req('DELETE', `/videos/${rv.id}/segments/${C.id}`, { revision: cNow.revision });
+  await addSeg(6500, 7000, '丁');
+  await addSeg(8000, 9000, '戊');
+  for (const s of (await getSegs(rv.id)).filter((x) => !x.reviewed)) await reviewSeg(rv.id, s);
+  r = await req('POST', `/videos/${rv.id}/publish`, {});
+  check('发布 v2', r.status === 201 && r.json.publication.version === 2);
+
+  // 合法预览：区间 [2000,5000]，边界与两侧片段端点相接（不穿过）
+  let p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 2000, end_ms: 5000 });
+  check('恢复预览 200', p.status === 200, JSON.stringify(p.json));
+  eq('预览待恢复 1 段（来自 v1）', p.json.to_restore.map((e) => [e.start_ms, e.end_ms, e.text]), [[3000, 4000, '乙']]);
+  eq('预览待移除 1 段（当前草稿）', p.json.to_remove.map((s) => [s.id, s.text]), [[B.id, '乙改']]);
+  check('预览返回确认令牌', typeof p.json.token === 'string' && p.json.token.length > 10);
+  const goodToken = p.json.token;
+
+  // 边界穿过任一侧片段 -> 422 并指出片段与时间
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 2000, end_ms: 3500 });
+  check('终点穿过草稿片段 -> 422', p.status === 422 && p.json.error.code === 'range_crosses_segment', JSON.stringify(p.json));
+  check('指出草稿片段与时间', p.json.error.crossings.some((c) =>
+    c.side === 'draft' && c.segment_id === B.id && c.boundary === 'end' && c.at === 3500), JSON.stringify(p.json.error));
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 2000, end_ms: 5500 });
+  check('终点穿过发布快照片段 -> 422', p.status === 422 && p.json.error.code === 'range_crosses_segment');
+  check('指出快照条目与时间', p.json.error.crossings.some((c) =>
+    c.side === 'published' && c.at === 5500 && /5000–6000/.test(c.message)), JSON.stringify(p.json.error));
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 1500, end_ms: 5000 });
+  check('起点穿过草稿片段 -> 422', p.status === 422 && p.json.error.crossings.some((c) =>
+    c.boundary === 'start' && c.at === 1500 && c.segment_id === A.id), JSON.stringify(p.json.error));
+
+  // 区间与版本参数校验
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 5000, end_ms: 5000 });
+  check('起点等于终点 -> 422', p.status === 422 && p.json.error.code === 'invalid_range');
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 6000, end_ms: 5000 });
+  check('起点晚于终点 -> 422', p.status === 422 && p.json.error.code === 'invalid_range');
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: -1, end_ms: 5000 });
+  check('负起点 -> 422', p.status === 422 && p.json.error.code === 'invalid_range');
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 2000, end_ms: 10001 });
+  check('终点越过视频时长 -> 422', p.status === 422 && p.json.error.code === 'invalid_range');
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 2000.5, end_ms: 5000 });
+  check('非整数区间 -> 422', p.status === 422 && p.json.error.code === 'invalid_range');
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 2000 });
+  check('缺少区间端点 -> 422', p.status === 422 && p.json.error.code === 'invalid_range');
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 99, start_ms: 2000, end_ms: 5000 });
+  check('版本不存在 -> 404', p.status === 404 && p.json.error.code === 'version_not_found');
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 'x', start_ms: 2000, end_ms: 5000 });
+  check('非法版本号 -> 422', p.status === 422 && p.json.error.code === 'invalid_version');
+  p = await req('POST', '/videos/999999/restore/preview', { version: 1, start_ms: 0, end_ms: 100 });
+  check('未知视频恢复预览 -> 404', p.status === 404);
+
+  console.log('12. 区间恢复确认：令牌、参数一致性与预览后草稿变化');
+  r = await req('POST', `/videos/${rv.id}/restore/confirm`, { version: 1, start_ms: 2000, end_ms: 5000 });
+  check('无令牌确认 -> 409 preview_required', r.status === 409 && r.json.error.code === 'preview_required');
+  r = await req('POST', `/videos/${rv.id}/restore/confirm`, { version: 1, start_ms: 2000, end_ms: 5000, token: 'garbage.token' });
+  check('坏令牌 -> 409 preview_required', r.status === 409 && r.json.error.code === 'preview_required');
+  r = await req('POST', `/videos/${rv.id}/restore/confirm`, { version: 2, start_ms: 2000, end_ms: 5000, token: goodToken });
+  check('版本与预览不一致 -> 422', r.status === 422 && r.json.error.code === 'restore_params_changed');
+  r = await req('POST', `/videos/${rv.id}/restore/confirm`, { version: 1, start_ms: 2000, end_ms: 5001, token: goodToken });
+  check('区间与预览不一致 -> 422', r.status === 422 && r.json.error.code === 'restore_params_changed');
+
+  // 预览后新增片段 -> 确认拒绝且不写入
+  const ghost = await addSeg(9000, 9500, '他人新增');
+  r = await req('POST', `/videos/${rv.id}/restore/confirm`, { version: 1, start_ms: 2000, end_ms: 5000, token: goodToken });
+  check('预览后草稿新增 -> 409 draft_changed', r.status === 409 && r.json.error.code === 'draft_changed', JSON.stringify(r.json));
+  check('冲突返回当前片段列表', Array.isArray(r.json.error.current_segments) && r.json.error.current_segments.length === 5);
+  await req('DELETE', `/videos/${rv.id}/segments/${ghost.id}`, { revision: 1 });
+
+  // 预览后审校状态变化 -> 同样拒绝
+  let aNow = (await getSegs(rv.id)).find((x) => x.id === A.id);
+  await req('POST', `/videos/${rv.id}/segments/${A.id}/review`, { reviewed: false, revision: aNow.revision });
+  r = await req('POST', `/videos/${rv.id}/restore/confirm`, { version: 1, start_ms: 2000, end_ms: 5000, token: goodToken });
+  check('预览后审校变化 -> 409 draft_changed', r.status === 409 && r.json.error.code === 'draft_changed');
+  aNow = (await getSegs(rv.id)).find((x) => x.id === A.id);
+  await req('POST', `/videos/${rv.id}/segments/${A.id}/review`, { reviewed: true, revision: aNow.revision });
+  eq('拒绝期间草稿未被写入', (await getSegs(rv.id)).map((s) => s.text), ['甲', '乙改', '丁', '戊']);
+
+  // 空区间（两侧均无片段）：合法且零变更
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 6000, end_ms: 6500 });
+  check('空区间预览 200 且清单为空', p.status === 200 && p.json.to_restore.length === 0 && p.json.to_remove.length === 0,
+    JSON.stringify(p.json));
+  r = await req('POST', `/videos/${rv.id}/restore/confirm`, { version: 1, start_ms: 6000, end_ms: 6500, token: p.json.token });
+  check('空区间确认 201 零变更', r.status === 201 && r.json.removed_count === 0 && r.json.restored_count === 0, JSON.stringify(r.json));
+  eq('空恢复后草稿不变', r.json.segments.map((s) => s.text), ['甲', '乙改', '丁', '戊']);
+
+  console.log('13. 区间恢复确认：成功恢复与不变量');
+  const before = await getSegs(rv.id);
+  const aBefore = before.find((x) => x.id === A.id);
+  const dBefore = before.find((x) => x.text === '丁');
+  p = await req('POST', `/videos/${rv.id}/restore/preview`, { version: 1, start_ms: 2000, end_ms: 5000 });
+  r = await req('POST', `/videos/${rv.id}/restore/confirm`, { version: 1, start_ms: 2000, end_ms: 5000, token: p.json.token });
+  check('确认恢复 201', r.status === 201, JSON.stringify(r.json));
+  eq('移除 1 段', r.json.removed_count, 1);
+  eq('恢复 1 段', r.json.restored_count, 1);
+  eq('被移除的是区间内草稿片段', r.json.removed[0].id, B.id);
+  const restored = r.json.restored[0];
+  check('恢复片段是新片段（新 id）', restored.id !== B.id);
+  eq('恢复片段修订号从 1 开始', restored.revision, 1);
+  eq('恢复片段为待审', restored.reviewed, false);
+  eq('恢复片段内容来自 v1', [restored.start_ms, restored.end_ms, restored.text], [3000, 4000, '乙']);
+  eq('恢复后共 4 段', r.json.segments.length, 4);
+  const aAfter = r.json.segments.find((x) => x.id === A.id);
+  eq('区间外片段修订号不变', aAfter.revision, aBefore.revision);
+  eq('区间外片段审校状态不变', aAfter.reviewed, aBefore.reviewed);
+  const dAfter = r.json.segments.find((x) => x.text === '丁');
+  eq('区间外片段 id 与修订号不变', [dAfter.id, dAfter.revision], [dBefore.id, dBefore.revision]);
+
+  const pubs = (await req('GET', `/videos/${rv.id}/publications`)).json.publications;
+  eq('历史发布版本不变', pubs.map((x) => x.version), [2, 1]);
+  const v1Srt = await (await fetch(`${BASE}/videos/${rv.id}/srt?version=1`)).text();
+  check('v1 SRT 导出语义不变', /甲/.test(v1Srt) && /乙/.test(v1Srt) && /丙/.test(v1Srt));
+  const draftSrt = await (await fetch(`${BASE}/videos/${rv.id}/srt?version=draft`)).text();
+  check('草稿 SRT 反映恢复结果', /乙/.test(draftSrt) && !/乙改/.test(draftSrt) && !/丙/.test(draftSrt));
+
+  // 发布门禁沿用：恢复片段待审 -> 不能发布；审校后可发布
+  r = await req('POST', `/videos/${rv.id}/publish`, {});
+  check('恢复片段待审阻止发布 -> 422', r.status === 422 && /未通过审校/.test(r.json.error.message));
+  const restoredNow = (await getSegs(rv.id)).find((x) => x.id === restored.id);
+  await reviewSeg(rv.id, restoredNow);
+  r = await req('POST', `/videos/${rv.id}/publish`, {});
+  check('恢复片段审校后可发布 v3', r.status === 201 && r.json.publication.version === 3, JSON.stringify(r.json));
+
+  console.log('14. 区间恢复：版本缺失与替换后时间线不合法（零写入）');
+  const rv2 = await uploadVideo('恢复保护', 5000, 48);
+  const one = (await req('POST', `/videos/${rv2.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '一' })).json.segment;
+  await reviewSeg(rv2.id, one);
+  r = await req('POST', `/videos/${rv2.id}/publish`, {});
+  check('第二个视频发布 v1', r.status === 201);
+  let p2 = await req('POST', `/videos/${rv2.id}/restore/preview`, { version: 1, start_ms: 0, end_ms: 2000 });
+  check('替换前预览 200', p2.status === 200, JSON.stringify(p2.json));
+  const rv2Token = p2.json.token;
+
+  // 直接改库模拟损坏快照：区间内条目互相重叠 -> 替换后时间线不合法
+  const Database = require('better-sqlite3');
+  const db = new Database(path.join(tmpDir, 'test.db'));
+  db.prepare('UPDATE publications SET snapshot = ? WHERE video_id = ? AND version = 1')
+    .run(JSON.stringify([
+      { start_ms: 500, end_ms: 1500, text: 'x' },
+      { start_ms: 1000, end_ms: 1800, text: 'y' },
+    ]), rv2.id);
+  r = await req('POST', `/videos/${rv2.id}/restore/confirm`, { version: 1, start_ms: 0, end_ms: 2000, token: rv2Token });
+  check('替换后时间线不合法 -> 422', r.status === 422 && r.json.error.code === 'invalid_timeline', JSON.stringify(r.json));
+  p2 = await req('POST', `/videos/${rv2.id}/restore/preview`, { version: 1, start_ms: 0, end_ms: 2000 });
+  check('预览同样拒绝非法替换', p2.status === 422 && p2.json.error.code === 'invalid_timeline');
+  eq('非法替换零写入', (await getSegs(rv2.id)).map((s) => [s.start_ms, s.end_ms, s.text]), [[1000, 2000, '一']]);
+
+  // 删除发布版本 -> 预览与确认均 404，且不写入
+  db.prepare('DELETE FROM publications WHERE video_id = ? AND version = 1').run(rv2.id);
+  db.close();
+  p2 = await req('POST', `/videos/${rv2.id}/restore/preview`, { version: 1, start_ms: 0, end_ms: 2000 });
+  check('版本被删后预览 -> 404', p2.status === 404 && p2.json.error.code === 'version_not_found');
+  r = await req('POST', `/videos/${rv2.id}/restore/confirm`, { version: 1, start_ms: 0, end_ms: 2000, token: rv2Token });
+  check('版本被删后确认 -> 404 且不写入', r.status === 404 && r.json.error.code === 'version_not_found');
+  eq('版本缺失零写入', (await getSegs(rv2.id)).length, 1);
 }
 
 const server = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
