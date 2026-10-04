@@ -210,7 +210,8 @@ function stopPolling() {
 function anyModalOpen() {
   return !$('editorModal').classList.contains('hidden') ||
          !$('conflictModal').classList.contains('hidden') ||
-         !$('importModal').classList.contains('hidden');
+         !$('importModal').classList.contains('hidden') ||
+         !$('restoreModal').classList.contains('hidden');
 }
 async function pollRefresh() {
   if (anyModalOpen() || !state.video) return;
@@ -256,6 +257,7 @@ function renderDetail() {
             <h2 style="margin:0">片段列表</h2>
             <div class="row-actions">
               <button class="btn small" id="importSrtBtn">⬆ 导入 SRT…</button>
+              <button class="btn small" id="restoreBtn">⏪ 从历史版本恢复区间…</button>
               <button class="btn primary small" id="addBtn">＋ 新增片段</button>
             </div>
           </div>
@@ -277,6 +279,7 @@ function renderDetail() {
   $('backLink').addEventListener('click', backToList);
   $('addBtn').addEventListener('click', () => openEditor('create'));
   $('importSrtBtn').addEventListener('click', openImportModal);
+  $('restoreBtn').addEventListener('click', openRestoreModal);
   const videoEl = $('videoPlayer');
   videoEl.addEventListener('timeupdate', onTimeUpdate);
 
@@ -766,6 +769,122 @@ async function confirmImport(mode) {
   }
 }
 
+/* ================= 区间恢复（历史发布版本 -> 草稿某区间整体替换） ================= */
+const restoreState = { preview: null, busy: false };
+
+function openRestoreModal() {
+  restoreState.preview = null;
+  restoreState.busy = false;
+  $('restoreError').textContent = '';
+  $('restoreResult').classList.add('hidden');
+  $('restoreConfirmBtn').disabled = true;
+
+  const sel = $('restoreVersion');
+  sel.innerHTML = state.publications.length
+    ? state.publications.map((p) => `<option value="${p.version}">v${p.version}（${p.segment_count} 段，${new Date(p.published_at).toLocaleString()}）</option>`).join('')
+    : '';
+  $('restoreStart').value = 0;
+  $('restoreEnd').value = state.video.duration_ms;
+
+  if (!state.publications.length) {
+    $('restoreError').textContent = '该视频尚无历史发布版本，无法恢复。请先发布至少一个版本。';
+    $('restorePreviewBtn').disabled = true;
+    $('restoreConfirmBtn').disabled = true;
+  } else {
+    $('restorePreviewBtn').disabled = false;
+  }
+  $('restoreModal').classList.remove('hidden');
+}
+function closeRestoreModal() {
+  $('restoreModal').classList.add('hidden');
+}
+function restoreParams() {
+  return {
+    version: Number($('restoreVersion').value),
+    start_ms: Number($('restoreStart').value),
+    end_ms: Number($('restoreEnd').value),
+  };
+}
+
+async function previewRestore() {
+  $('restoreError').textContent = '';
+  const params = restoreParams();
+  try {
+    const data = await api(`/api/videos/${state.video.id}/restore/preview`, { method: 'POST', body: params });
+    restoreState.preview = data;
+    renderRestorePreview(data);
+  } catch (err) {
+    restoreState.preview = null;
+    $('restoreResult').classList.add('hidden');
+    $('restoreConfirmBtn').disabled = true;
+    const errs = err.data && Array.isArray(err.data.errors) ? err.data.errors : [];
+    const crossings = err.data && Array.isArray(err.data.crossings) ? err.data.crossings : [];
+    let detail = `预览失败，未写入任何内容：${err.message}`;
+    if (crossings.length > 1) detail += `\n（共 ${crossings.length} 处边界穿越，以下列出前 20 条）`;
+    const list = crossings.slice(0, 20).map((c) => `· ${c.message}`).join('\n');
+    $('restoreError').textContent = list ? `${detail}\n${list}` : detail;
+  }
+}
+
+function segRows(segs, withStatus, indexKey) {
+  const cols = withStatus ? 4 : 3;
+  if (!segs.length) return `<tr><td colspan="${cols}" class="meta">（区间内没有片段）</td></tr>`;
+  return segs.map((s) => `
+    <tr>
+      <td class="mono">${indexKey ? s[indexKey] : s.id}</td>
+      <td class="mono">${fmtTime(s.start_ms)}<br>→ ${fmtTime(s.end_ms)}</td>
+      ${withStatus ? `<td>${s.reviewed ? '<span class="tag ok">已审</span>' : '<span class="tag warn">待审</span>'}</td>` : ''}
+      <td class="seg-text-cell">${esc(s.text) || '<span class="meta">(空)</span>'}</td>
+    </tr>`).join('');
+}
+
+function renderRestorePreview(data) {
+  $('restoreError').textContent = '';
+  $('restoreResult').classList.remove('hidden');
+  $('restoreSummary').innerHTML =
+    `将以历史版本 <b>v${data.version}</b> 整体替换区间 <b>${data.range.start_ms}–${data.range.end_ms}ms</b>：` +
+    `移除当前草稿 <b>${data.removed_count}</b> 段，恢复历史片段 <b>${data.restored_count}</b> 段（全部待审、修订号从 1 开始），` +
+    `区间外 <b>${data.outside_kept_count}</b> 段草稿（含修订号）保持不变。`;
+  $('restoreDraftTbody').innerHTML = segRows(data.draft_in_range, true);
+  $('restoreSnapTbody').innerHTML = segRows(data.snapshot_in_range, false, 'snapshot_index');
+  $('restoreConfirmBtn').disabled = false;
+}
+
+async function confirmRestore() {
+  const p = restoreState.preview;
+  if (restoreState.busy || !p) return;
+  if (!confirm(`确认从 v${p.version} 恢复区间 ${p.range.start_ms}–${p.range.end_ms}ms？\n` +
+      `将移除 ${p.removed_count} 段当前草稿，并恢复 ${p.restored_count} 段历史片段（均为待审）。\n` +
+      `区间外草稿、历史发布版本与 SRT 导出不受影响。`)) {
+    return;
+  }
+  restoreState.busy = true;
+  $('restoreConfirmBtn').disabled = true;
+  try {
+    const data = await api(`/api/videos/${state.video.id}/restore/confirm`, {
+      method: 'POST',
+      body: { version: p.version, start_ms: p.range.start_ms, end_ms: p.range.end_ms, token: p.token },
+    });
+    state.segments = data.segments;
+    closeRestoreModal();
+    renderSegmentDependent();
+    toast(`已整批恢复：移除 ${data.removed_count} 段，恢复 ${data.restored_count} 段（均为待审）`);
+  } catch (err) {
+    if (err.status === 409 && err.data && Array.isArray(err.data.current_segments)) {
+      // 预览后草稿发生增删改或审校变化：拒绝并要求重新预览
+      state.segments = err.data.current_segments;
+      renderSegmentDependent();
+      closeRestoreModal();
+      toast('预览后草稿已变化，本次恢复被拒绝，请重新预览', true);
+      return;
+    }
+    $('restoreError').textContent = `确认失败，未写入任何内容：${err.message}`;
+    if (restoreState.preview) $('restoreConfirmBtn').disabled = false;
+  } finally {
+    restoreState.busy = false;
+  }
+}
+
 /* ================= 弹窗事件绑定 ================= */
 document.addEventListener('click', (e) => {
   const menu = $('downloadMenu');
@@ -787,6 +906,13 @@ $('importFile').addEventListener('change', (e) => {
   const f = e.target.files[0];
   $('importFileMsg').textContent = f ? `已选择 ${f.name}（${(f.size / 1024).toFixed(1)} KB），点击「解析并预览」` : '';
 });
+
+$('restoreCancel').addEventListener('click', closeRestoreModal);
+$('restorePreviewBtn').addEventListener('click', previewRestore);
+$('restoreConfirmBtn').addEventListener('click', confirmRestore);
+$('restoreStartNow').addEventListener('click', () => { $('restoreStart').value = currentMs(); });
+$('restoreEndNow').addEventListener('click', () => { $('restoreEnd').value = currentMs(); });
+$('restoreModal').addEventListener('click', (e) => { if (e.target === $('restoreModal')) closeRestoreModal(); });
 
 /* ================= 启动 ================= */
 loadList().catch((e) => {

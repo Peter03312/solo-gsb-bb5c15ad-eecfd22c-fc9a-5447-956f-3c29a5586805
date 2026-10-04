@@ -557,13 +557,13 @@ function draftFingerprint(segments) {
 function srtHash(content) {
   return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
 }
-function makePreviewToken({ videoId, mode, draftHash, contentHash }) {
-  const payload = JSON.stringify({ v: videoId, m: mode, d: draftHash, c: contentHash });
-  const b64 = Buffer.from(payload, 'utf8').toString('base64url');
+// 通用 HMAC 预览令牌：把“所见内容 + 草稿指纹”等绑定到确认请求；随服务进程重启失效
+function signToken(payload) {
+  const b64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(b64).digest('base64url');
   return `${b64}.${sig}`;
 }
-function readPreviewToken(token) {
+function verifyToken(token) {
   if (typeof token !== 'string' || !token.includes('.')) return null;
   const [b64, sig] = token.split('.');
   const expected = crypto.createHmac('sha256', TOKEN_SECRET).update(b64).digest('base64url');
@@ -628,8 +628,8 @@ router.post('/videos/:id(\\d+)/srt/preview', srtUploadOptional, (req, res, next)
 
     const draftHash = draftFingerprint(existing);
     const contentHash = srtHash(content);
-    const token = makePreviewToken({
-      videoId: video.id, mode: 'preview', draftHash, contentHash,
+    const token = signToken({
+      v: video.id, m: 'preview', d: draftHash, c: contentHash,
     });
 
     res.json({
@@ -661,7 +661,7 @@ router.post('/videos/:id(\\d+)/srt/import', srtUploadOptional, (req, res, next) 
     const video = loadVideo(videoId);
     const mode = req.body && req.body.mode === 'replace' ? 'replace' : req.body && req.body.mode === 'append' ? 'append' : null;
     if (!mode) throw new ApiError(422, 'invalid_mode', '请指定写入方式 mode：append（追加到草稿）或 replace（替换整个草稿）');
-    const token = readPreviewToken(req.body && req.body.token);
+    const token = verifyToken(req.body && req.body.token);
     if (!token) {
       throw new ApiError(409, 'preview_required', '缺少有效的预览令牌：请先调用预览接口，再以预览返回的 token 确认');
     }
@@ -713,6 +713,205 @@ router.post('/videos/:id(\\d+)/srt/import', srtUploadOptional, (req, res, next) 
       ok: true,
       mode: result.mode,
       imported_count: result.imported_count,
+      segments: listSegments(video.id),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ---------------- 区间恢复（预览 -> 确认，从历史发布版本整体替换某区间） ---------------- */
+
+// 区间归属判定（半开 [start,end)）：
+//  - inside:  整体位于区间内（start_ms >= start && end_ms <= end）
+//  - outside: 整体位于区间外且不穿越边界（端点相接允许）
+//  - crossing: 任一侧边界落在片段内部（start < s.start_ms < end < s.end_ms 等）
+function classifyByRange(segs, startMs, endMs) {
+  const inside = [];
+  const outside = [];
+  const crossing = [];
+  for (const s of segs) {
+    if (s.start_ms >= startMs && s.end_ms <= endMs) {
+      inside.push(s);
+    } else if (s.end_ms <= startMs || s.start_ms >= endMs) {
+      outside.push(s);
+    } else {
+      crossing.push(s);
+    }
+  }
+  return { inside, outside, crossing };
+}
+
+function loadSnapshot(videoId, version) {
+  const row = get()
+    .prepare('SELECT * FROM publications WHERE video_id = ? AND version = ?')
+    .get(videoId, version);
+  if (!row) throw new ApiError(404, 'version_not_found', `已发布版本 v${version} 不存在`);
+  return { row, segments: JSON.parse(row.snapshot) };
+}
+
+// 读取并校验 {version,start_ms,end_ms}：格式/取值/顺序/越界均非法，直接 422
+function readRangeBody(body, durationMs) {
+  const version = Number(body && body.version);
+  if (!Number.isInteger(version) || version < 1) {
+    throw new ApiError(422, 'invalid_version', '请指定正整数形式的历史发布版本号 version');
+  }
+  const startMs = Number(body && body.start_ms);
+  const endMs = Number(body && body.end_ms);
+  if (!isInt(startMs) || !isInt(endMs)) {
+    throw new ApiError(422, 'invalid_time', '区间起止时间必须为整数毫秒（start_ms、end_ms）');
+  }
+  if (startMs < 0 || startMs > durationMs || endMs < 0 || endMs > durationMs) {
+    throw new ApiError(422, 'range_out_of_bounds',
+      `区间越界：起止点必须在 0–${durationMs}ms（视频时长）以内，实际为 ${startMs}–${endMs}ms`);
+  }
+  if (startMs >= endMs) {
+    throw new ApiError(422, 'invalid_range',
+      `区间起点（${startMs}ms）必须早于终点（${endMs}ms）`);
+  }
+  return { version, start_ms: startMs, end_ms: endMs };
+}
+
+// 边界穿过任一侧片段 -> 422，逐条指出片段及时间
+function rejectIfBoundaryCrosses({ draftCrossing, snapCrossing, startMs, endMs }) {
+  const crossings = [];
+  for (const s of draftCrossing) {
+    crossings.push({
+      side: 'draft', segment_id: s.id, start_ms: s.start_ms, end_ms: s.end_ms,
+      message: `区间边界（${startMs}–${endMs}ms）穿过当前草稿片段 #${s.id}` +
+        `（${s.start_ms}–${s.end_ms}ms），请调整区间端点使其不切开任何片段（端点相接允许）`,
+    });
+  }
+  for (const s of snapCrossing) {
+    crossings.push({
+      side: 'snapshot', snapshot_index: s.snapshot_index, start_ms: s.start_ms, end_ms: s.end_ms,
+      message: `区间边界（${startMs}–${endMs}ms）穿过历史版本 v${s.version} 第 ${s.snapshot_index} 个片段` +
+        `（${s.start_ms}–${s.end_ms}ms），请调整区间端点使其不切开任何片段（端点相接允许）`,
+    });
+  }
+  if (crossings.length) {
+    throw new ApiError(422, 'boundary_crosses_segment',
+      `区间边界穿过 ${crossings.length} 个片段，已拒绝：\n${crossings[0].message}`,
+      { crossings });
+  }
+}
+
+// 计算恢复计划：两侧片段分类 + 穿越校验；不写库
+function buildRestorePlan(video, version, startMs, endMs) {
+  const { row, segments: snapSegs } = loadSnapshot(video.id, version);
+  const snapOrdered = [...snapSegs].sort((a, b) => a.start_ms - b.start_ms).map((s, i) => ({
+    ...s, version, snapshot_index: i + 1,
+  }));
+  const draft = listSegments(video.id);
+
+  const draftPart = classifyByRange(draft, startMs, endMs);
+  const snapPart = classifyByRange(snapOrdered, startMs, endMs);
+  rejectIfBoundaryCrosses({
+    draftCrossing: draftPart.crossing, snapCrossing: snapPart.crossing, startMs, endMs,
+  });
+
+  return {
+    publication: row,
+    draftInside: draftPart.inside,
+    draftOutside: draftPart.outside,
+    snapInside: snapPart.inside,
+  };
+}
+
+router.post('/videos/:id(\\d+)/restore/preview', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const { version, start_ms: startMs, end_ms: endMs } = readRangeBody(req.body || {}, video.duration_ms);
+    const plan = buildRestorePlan(video, version, startMs, endMs);
+
+    const draftHash = draftFingerprint(listSegments(video.id));
+    const token = signToken({
+      v: video.id, m: 'restore', ver: version, st: startMs, en: endMs, d: draftHash,
+    });
+
+    res.json({
+      version,
+      range: { start_ms: startMs, end_ms: endMs, duration_ms: video.duration_ms },
+      draft_in_range: plan.draftInside,
+      snapshot_in_range: plan.snapInside.map(({ version: _v, ...rest }) => rest),
+      to_remove: plan.draftInside,
+      to_restore: plan.snapInside.map(({ version: _v, ...rest }) => rest),
+      outside_kept_count: plan.draftOutside.length,
+      removed_count: plan.draftInside.length,
+      restored_count: plan.snapInside.length,
+      token,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/videos/:id(\\d+)/restore/confirm', (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const video = loadVideo(videoId);
+    const body = req.body || {};
+    const token = verifyToken(body.token);
+    if (!token || token.m !== 'restore') {
+      throw new ApiError(409, 'preview_required',
+        '缺少有效的区间恢复预览令牌：请先调用区间恢复预览接口，再以预览返回的 token 确认');
+    }
+    // 确认的版本与区间必须与预览一致（须由请求体原样回传）
+    const { version, start_ms: startMs, end_ms: endMs } = readRangeBody(body, video.duration_ms);
+    if (token.v !== video.id || token.ver !== version || token.st !== startMs || token.en !== endMs) {
+      throw new ApiError(422, 'restore_mismatch',
+        '确认的版本或区间与预览不一致，请按预览返回的版本与区间重新确认；本次未写入任何内容');
+    }
+
+    // 预览后草稿发生增删改或审校变化 -> 指纹不同 -> 拒绝并要求重新预览
+    const currentSegments = listSegments(video.id);
+    if (token.d !== draftFingerprint(currentSegments)) {
+      throw new ApiError(409, 'draft_changed',
+        '预览之后草稿已被修改（增删改或审校变化，可能是他人操作）。请重新预览后再确认；本次未写入任何内容',
+        { current_segments: currentSegments });
+    }
+
+    const result = get().transaction(() => {
+      const lockedVideo = get().prepare('SELECT * FROM videos WHERE id = ?').get(videoId);
+      if (!lockedVideo) throw new ApiError(404, 'not_found', `视频 #${videoId} 不存在`);
+
+      // 不信任预览结果：事务内重新加载版本快照与最新草稿并完整复核
+      const plan = buildRestorePlan(lockedVideo, version, startMs, endMs);
+
+      // 区间外草稿片段 + 区间内历史片段组成替换后时间线，必须合法才允许写入
+      const finalTimeline = [
+        ...plan.draftOutside.map((s) => ({ id: s.id, start_ms: s.start_ms, end_ms: s.end_ms })),
+        ...plan.snapInside.map((s) => ({ id: `v${version}-${s.snapshot_index}`, start_ms: s.start_ms, end_ms: s.end_ms })),
+      ];
+      const check = validateTimeline(finalTimeline, lockedVideo.duration_ms);
+      if (!check.ok) {
+        throw new ApiError(422, 'invalid_timeline', `恢复后时间线不合法，已拒绝：${check.reason}`);
+      }
+
+      // 区间内草稿整体删除；区间外片段（含修订号/审校状态）原样保留
+      const removeIds = plan.draftInside.map((s) => s.id);
+      const delStmt = get().prepare('DELETE FROM segments WHERE id = ? AND video_id = ?');
+      for (const id of removeIds) delStmt.run(id, videoId);
+
+      // 区间内历史片段整体恢复为新草稿片段：新 id、revision=1、一律待审
+      const ts = now();
+      const insert = get().prepare(
+        `INSERT INTO segments (video_id, start_ms, end_ms, text, reviewed, revision, updated_at)
+         VALUES (?, ?, ?, ?, 0, 1, ?)`
+      );
+      for (const s of plan.snapInside) {
+        insert.run(videoId, s.start_ms, s.end_ms, s.text, ts);
+      }
+
+      return { removed_count: removeIds.length, restored_count: plan.snapInside.length };
+    })();
+
+    res.status(201).json({
+      ok: true,
+      version,
+      range: { start_ms: startMs, end_ms: endMs },
+      removed_count: result.removed_count,
+      restored_count: result.restored_count,
       segments: listSegments(video.id),
     });
   } catch (err) {

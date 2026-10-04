@@ -194,6 +194,13 @@ video { width: 100%; background: #000; border-radius: 8px; max-height: 420px; }
 .conflict-box li { margin: 3px 0; }
 tr.import-conflict td { background: rgba(240,169,59,.12); }
 
+/* 区间恢复 */
+.restore-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 6px; }
+@media (max-width: 820px) { .restore-cols { grid-template-columns: 1fr; } }
+.restore-scroll { max-height: 260px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; margin-top: 6px; }
+.restore-scroll table { font-size: 12px; }
+.restore-scroll th, .restore-scroll td { padding: 5px 7px; }
+
 /* toast */
 .toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
